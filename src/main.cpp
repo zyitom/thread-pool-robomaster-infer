@@ -6,11 +6,11 @@
 #include <filesystem>
 #include <numeric>
 #include <vector>
-#include <future>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <thread>
 
 std::string getTypeName(int tag_id) {
     switch (tag_id) {
@@ -24,6 +24,8 @@ struct FrameResult {
     int sequence;
     cv::Mat frame;
 };
+
+std::atomic<bool> exitDisplayThread(false);  // 控制显示线程退出的全局变量
 
 int main() {
     std::string directory = "../models/";
@@ -69,69 +71,90 @@ int main() {
 
     cv::Mat frame;
     std::vector<double> processingTimes;
-    std::queue<FrameResult> resultsQueue;
+
+    auto compare = [](const FrameResult& lhs, const FrameResult& rhs) {
+        return lhs.sequence > rhs.sequence;
+    };
+    std::priority_queue<FrameResult, std::vector<FrameResult>, decltype(compare)> resultsQueue(compare);
     std::mutex queueMutex;
     std::condition_variable cv;
     std::atomic<int> sequenceNumber = 0;
     std::atomic<int> nextFrameToShow = 0;
 
+    // 启动显示帧的线程
+       std::thread display_thread([&]() {
+        while (!exitDisplayThread) {
+            std::unique_lock<std::mutex> lk(queueMutex);
+            cv.wait(lk, [&resultsQueue, &nextFrameToShow] {
+                return exitDisplayThread || (!resultsQueue.empty() && resultsQueue.top().sequence <= nextFrameToShow);
+            });
+
+            if (exitDisplayThread) {
+                break;
+            }
+
+            while (!resultsQueue.empty() && resultsQueue.top().sequence <= nextFrameToShow) {
+                FrameResult result = resultsQueue.top();
+                resultsQueue.pop();
+                lk.unlock();
+
+                // 计算平均推理时间
+                double avgTime = std::accumulate(processingTimes.begin(), processingTimes.end(), 0.0) / processingTimes.size();
+                std::string avgTimeLabel = "Average Inference Time: " + std::to_string(avgTime * 1000) + " ms";
+
+                // 在帧上显示平均推理时间
+                cv::putText(result.frame, avgTimeLabel, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
+
+                // 显示处理后的帧
+                std::cout << "Displaying frame: " << result.sequence << std::endl;
+                cv::imshow("Detected Objects", result.frame);
+                if (cv::waitKey(30) >= 0) {
+                    exitDisplayThread = true;
+                    break;
+                }
+
+                nextFrameToShow++;
+                lk.lock();
+            }
+        }
+    });
+
+
     while (cap.read(frame)) {
         cv::Mat frameCopy = frame.clone();
         int currentSequence = sequenceNumber++;
 
-       pool.enqueue([&trtModule, &processingTimes, &queueMutex, &cv, frameCopy, currentSequence, &resultsQueue]() mutable {
-           std::cout << "Processing frame: " << currentSequence << std::endl;
-        int64 start = cv::getTickCount();
+        pool.enqueue([&trtModule, &processingTimes, &queueMutex, &cv, frameCopy, currentSequence, &resultsQueue]() mutable {
+            std::cout << "Processing frame: " << currentSequence << std::endl;
+            int64 start = cv::getTickCount();
 
-        // 在线程池中处理帧
-        std::vector<bbox_t> boxes = trtModule(frameCopy);
+            // 在线程池中处理帧
+            std::vector<bbox_t> boxes = trtModule(frameCopy);
 
-        // 在 frameCopy 上绘制 bounding boxes 和标签
-        for (const auto& box : boxes) {
-            for (int i = 0; i < 4; i++) {
-                cv::line(frameCopy, box.pts[i], box.pts[(i+1)%4], cv::Scalar(0, 255, 0), 2);
+            // 在 frameCopy 上绘制 bounding boxes 和标签
+            for (const auto& box : boxes) {
+                for (int i = 0; i < 4; i++) {
+                    cv::line(frameCopy, box.pts[i], box.pts[(i+1)%4], cv::Scalar(0, 255, 0), 2);
+                }
+                std::string type_name = getTypeName(box.tag_id);
+                std::string label = type_name + " - " + std::to_string(box.confidence);
+                cv::putText(frameCopy, label, box.pts[0], cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
             }
-            std::string type_name = getTypeName(box.tag_id);
-            std::string label = type_name + " - " + std::to_string(box.confidence);
-            cv::putText(frameCopy, label, box.pts[0], cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
-        }
 
-                double elapsedTime = (cv::getTickCount() - start) / cv::getTickFrequency();
-        {
-            std::lock_guard<std::mutex> lock(queueMutex);
-            processingTimes.push_back(elapsedTime);
-            resultsQueue.push({currentSequence, frameCopy});
-            std::cout << "Frame processed: " << currentSequence << std::endl;
-        }
-        cv.notify_one();
-    });  // 注意这里：之前的代码多了一个大括号
-}
-
-
-
-    // 主线程显示帧
-    while (nextFrameToShow < sequenceNumber) {
-        std::unique_lock<std::mutex> lk(queueMutex);
-        cv.wait(lk, [&resultsQueue, &nextFrameToShow]{
-            return !resultsQueue.empty() && resultsQueue.front().sequence == nextFrameToShow;
+            double elapsedTime = (cv::getTickCount() - start) / cv::getTickFrequency();
+            {
+                std::lock_guard<std::mutex> lock(queueMutex);
+                processingTimes.push_back(elapsedTime);
+                resultsQueue.push({currentSequence, frameCopy});
+                std::cout << "Frame processed: " << currentSequence << std::endl;
+            }
+            cv.notify_one();
         });
-
-        FrameResult result = resultsQueue.front();
-std::cout << "Displaying frame: " << result.sequence << std::endl;
-        resultsQueue.pop();
-        lk.unlock();
-
-        double avgTime = std::accumulate(processingTimes.begin(), processingTimes.end(), 0.0) / (nextFrameToShow + 1);
-        std::string avgTimeLabel = "Average Time: " + std::to_string(avgTime * 1000) + " ms";
-        cv::putText(result.frame, avgTimeLabel, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
-
-        cv::imshow("Detected Objects", result.frame);
-        if (cv::waitKey(30) == 27) {
-            break;
-        }
-
-        nextFrameToShow++;
     }
+
+    // 设置退出标志并等待显示线程结束
+    exitDisplayThread = true;
+    display_thread.join();
 
     return 0;
 }
