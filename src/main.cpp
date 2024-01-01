@@ -6,16 +6,24 @@
 #include <filesystem>
 #include <numeric>
 #include <vector>
+#include <future>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 
 std::string getTypeName(int tag_id) {
-    // 根据 tag_id 返回相应的类型名称
     switch (tag_id) {
         case 0: return "类型1";
         case 1: return "类型2";
-        // 其他类型...
         default: return "未知";
     }
 }
+
+struct FrameResult {
+    int sequence;
+    cv::Mat frame;
+};
 
 int main() {
     std::string directory = "../models/";
@@ -41,7 +49,7 @@ int main() {
     int choice;
     std::cout << "请选择一个模型（输入数字）: ";
     std::cin >> choice;
-    if (choice < 1 || choice > choices.size()) {
+    if (choice < 1 or choice > choices.size()) {
         std::cerr << "无效选择" << std::endl;
         return -1;
     }
@@ -51,7 +59,9 @@ int main() {
     std::string cache_path = selected_model_base_path + ".cache";
     TRTModule trtModule(onnx_path, cache_path);
 
+    ThreadPool pool(std::thread::hardware_concurrency());
     cv::VideoCapture cap(videoPath);
+
     if (!cap.isOpened()) {
         std::cerr << "无法打开视频文件: " << videoPath << std::endl;
         return -1;
@@ -59,41 +69,68 @@ int main() {
 
     cv::Mat frame;
     std::vector<double> processingTimes;
+    std::queue<FrameResult> resultsQueue;
+    std::mutex queueMutex;
+    std::condition_variable cv;
+    std::atomic<int> sequenceNumber = 0;
+    std::atomic<int> nextFrameToShow = 0;
 
     while (cap.read(frame)) {
+        cv::Mat frameCopy = frame.clone();
+        int currentSequence = sequenceNumber++;
+
+       pool.enqueue([&trtModule, &processingTimes, &queueMutex, &cv, frameCopy, currentSequence, &resultsQueue]() mutable {
+           std::cout << "Processing frame: " << currentSequence << std::endl;
         int64 start = cv::getTickCount();
 
-        // 直接在主线程中处理每一帧
-        std::vector<bbox_t> boxes = trtModule(frame);
+        // 在线程池中处理帧
+        std::vector<bbox_t> boxes = trtModule(frameCopy);
 
-        double elapsedTime = (cv::getTickCount() - start) / cv::getTickFrequency();
-        processingTimes.push_back(elapsedTime);
-
+        // 在 frameCopy 上绘制 bounding boxes 和标签
         for (const auto& box : boxes) {
             for (int i = 0; i < 4; i++) {
-                cv::line(frame, box.pts[i], box.pts[(i+1)%4], cv::Scalar(0, 255, 0), 2);
+                cv::line(frameCopy, box.pts[i], box.pts[(i+1)%4], cv::Scalar(0, 255, 0), 2);
             }
             std::string type_name = getTypeName(box.tag_id);
             std::string label = type_name + " - " + std::to_string(box.confidence);
-            cv::putText(frame, label, box.pts[0], cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
+            cv::putText(frameCopy, label, box.pts[0], cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
         }
 
-        if (!processingTimes.empty()) {
-            double avgTimeInMilliseconds = std::accumulate(processingTimes.begin(), processingTimes.end(), 0.0) / processingTimes.size() * 1000.0;
-            std::string avgTimeLabel = "Avg. Time: " + std::to_string(avgTimeInMilliseconds) + " ms";
-            cv::putText(frame, avgTimeLabel, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 0, 0), 2);
+                double elapsedTime = (cv::getTickCount() - start) / cv::getTickFrequency();
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            processingTimes.push_back(elapsedTime);
+            resultsQueue.push({currentSequence, frameCopy});
+            std::cout << "Frame processed: " << currentSequence << std::endl;
         }
+        cv.notify_one();
+    });  // 注意这里：之前的代码多了一个大括号
+}
 
-        cv::imshow("Detected Objects", frame);
+
+
+    // 主线程显示帧
+    while (nextFrameToShow < sequenceNumber) {
+        std::unique_lock<std::mutex> lk(queueMutex);
+        cv.wait(lk, [&resultsQueue, &nextFrameToShow]{
+            return !resultsQueue.empty() && resultsQueue.front().sequence == nextFrameToShow;
+        });
+
+        FrameResult result = resultsQueue.front();
+std::cout << "Displaying frame: " << result.sequence << std::endl;
+        resultsQueue.pop();
+        lk.unlock();
+
+        double avgTime = std::accumulate(processingTimes.begin(), processingTimes.end(), 0.0) / (nextFrameToShow + 1);
+        std::string avgTimeLabel = "Average Time: " + std::to_string(avgTime * 1000) + " ms";
+        cv::putText(result.frame, avgTimeLabel, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
+
+        cv::imshow("Detected Objects", result.frame);
         if (cv::waitKey(30) == 27) {
             break;
         }
-    }
 
-    if (!processingTimes.empty()) {
-        double totalElapsedTime = std::accumulate(processingTimes.begin(), processingTimes.end(), 0.0);
-        double avgTimeInMilliseconds = totalElapsedTime / processingTimes.size() * 1000.0;
-        std::cout << "Average Processing Time for Entire Video: " << avgTimeInMilliseconds << " ms" << std::endl;
+        nextFrameToShow++;
     }
 
     return 0;
