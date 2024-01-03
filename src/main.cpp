@@ -6,7 +6,7 @@
 #include <filesystem>
 #include <numeric>
 #include <vector>
-#include <queue>
+#include <deque>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
@@ -25,12 +25,15 @@ struct FrameResult {
     cv::Mat frame;
 };
 
-std::atomic<bool> exitDisplayThread(false);  // 控制显示线程退出的全局变量
+std::atomic<bool> exitDisplayThread(false);
+std::mutex queueMutex;
+std::condition_variable conditionVar;
 
 int main() {
     std::string directory = "../models/";
     std::string videoPath = "../../test1.avi";
     std::set<std::string> model_files;
+    const size_t maxQueueSize = 100;
 
     // 搜索模型文件
     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
@@ -42,16 +45,15 @@ int main() {
     }
 
     std::vector<std::string> choices;
-    int idx = 0;
     for (const auto& file : model_files) {
-        std::cout << ++idx << ". " << file << std::endl;
         choices.push_back(file);
+        std::cout << choices.size() << ". " << file << std::endl;
     }
 
     int choice;
     std::cout << "请选择一个模型（输入数字）: ";
     std::cin >> choice;
-    if (choice < 1 or choice > choices.size()) {
+    if (choice < 1 || choice > choices.size()) {
         std::cerr << "无效选择" << std::endl;
         return -1;
     }
@@ -71,67 +73,63 @@ int main() {
 
     cv::Mat frame;
     std::vector<double> processingTimes;
-
-    auto compare = [](const FrameResult& lhs, const FrameResult& rhs) {
-        return lhs.sequence > rhs.sequence;
-    };
-    std::priority_queue<FrameResult, std::vector<FrameResult>, decltype(compare)> resultsQueue(compare);
-    std::mutex queueMutex;
-    std::condition_variable cv;
+    std::deque<FrameResult> frameQueue;
     std::atomic<int> sequenceNumber = 0;
     std::atomic<int> nextFrameToShow = 0;
 
-    // 启动显示帧的线程
-       std::thread display_thread([&]() {
-        while (!exitDisplayThread) {
-            std::unique_lock<std::mutex> lk(queueMutex);
-            cv.wait(lk, [&resultsQueue, &nextFrameToShow] {
-                return exitDisplayThread || (!resultsQueue.empty() && resultsQueue.top().sequence <= nextFrameToShow);
-            });
+    std::thread display_thread([&]() {
+    while (!exitDisplayThread) {
+        std::unique_lock<std::mutex> lk(queueMutex);
+        conditionVar.wait(lk, [&frameQueue, &nextFrameToShow] {
+            return exitDisplayThread || (!frameQueue.empty() && frameQueue.front().sequence == nextFrameToShow);
+        });
 
-            if (exitDisplayThread) {
-                break;
+        while (!frameQueue.empty() && frameQueue.front().sequence == nextFrameToShow) {
+            FrameResult result = frameQueue.front();
+            frameQueue.pop_front();
+
+            double avgTime = 0.0;
+            if (!processingTimes.empty()) {
+                avgTime = std::accumulate(processingTimes.begin(), processingTimes.end(), 0.0) / processingTimes.size();
             }
+            std::string avgTimeLabel = "Avg Inference Time: " + std::to_string(avgTime * 1000) + " ms";
+            cv::putText(result.frame, avgTimeLabel, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
+            // 在帧上显示已处理的帧数
+            std::cout << "已显示 " << nextFrameToShow << " 帧" << std::endl; // 添加这一行来监控已显示的帧数
+std::string frameCountLabel = "Processed Frames: " + std::to_string(nextFrameToShow);
+cv::putText(result.frame, frameCountLabel, cv::Point(10, 50), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
 
-            while (!resultsQueue.empty() && resultsQueue.top().sequence <= nextFrameToShow) {
-                FrameResult result = resultsQueue.top();
-                resultsQueue.pop();
-                lk.unlock();
-
-                // 计算平均推理时间
-                double avgTime = std::accumulate(processingTimes.begin(), processingTimes.end(), 0.0) / processingTimes.size();
-                std::string avgTimeLabel = "Average Inference Time: " + std::to_string(avgTime * 1000) + " ms";
-
-                // 在帧上显示平均推理时间
-                cv::putText(result.frame, avgTimeLabel, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
-
-                // 显示处理后的帧
-                std::cout << "Displaying frame: " << result.sequence << std::endl;
                 cv::imshow("Detected Objects", result.frame);
-                if (cv::waitKey(30) >= 0) {
+                if (cv::waitKey(2) >= 0) {
                     exitDisplayThread = true;
                     break;
                 }
 
                 nextFrameToShow++;
-                lk.lock();
             }
+            lk.unlock();
+            conditionVar.notify_all();
         }
     });
 
-
     while (cap.read(frame)) {
+        std::unique_lock<std::mutex> lock(queueMutex);
+        if (frameQueue.size() >= maxQueueSize) {
+            conditionVar.wait(lock, [&frameQueue, &maxQueueSize] {
+                return frameQueue.size() < maxQueueSize;
+            });
+        }
+        lock.unlock();
+std::cout << "处理第 " << sequenceNumber << " 帧" << std::endl; // 添加这一行来监控正在处理的帧序号
         cv::Mat frameCopy = frame.clone();
         int currentSequence = sequenceNumber++;
 
-        pool.enqueue([&trtModule, &processingTimes, &queueMutex, &cv, frameCopy, currentSequence, &resultsQueue]() mutable {
-            std::cout << "Processing frame: " << currentSequence << std::endl;
-            int64 start = cv::getTickCount();
+        pool.enqueue([&trtModule, &processingTimes, frameCopy, currentSequence, &frameQueue]() mutable {
+    int64 start = cv::getTickCount();
 
-            // 在线程池中处理帧
+
             std::vector<bbox_t> boxes = trtModule(frameCopy);
 
-            // 在 frameCopy 上绘制 bounding boxes 和标签
             for (const auto& box : boxes) {
                 for (int i = 0; i < 4; i++) {
                     cv::line(frameCopy, box.pts[i], box.pts[(i+1)%4], cv::Scalar(0, 255, 0), 2);
@@ -143,16 +141,16 @@ int main() {
 
             double elapsedTime = (cv::getTickCount() - start) / cv::getTickFrequency();
             {
-                std::lock_guard<std::mutex> lock(queueMutex);
-                processingTimes.push_back(elapsedTime);
-                resultsQueue.push({currentSequence, frameCopy});
-                std::cout << "Frame processed: " << currentSequence << std::endl;
+                
+        std::lock_guard<std::mutex> lock(queueMutex);
+        processingTimes.push_back(elapsedTime);
+        frameQueue.push_back({currentSequence, frameCopy});
+        conditionVar.notify_one();
             }
-            cv.notify_one();
+            conditionVar.notify_one();
         });
     }
 
-    // 设置退出标志并等待显示线程结束
     exitDisplayThread = true;
     display_thread.join();
 

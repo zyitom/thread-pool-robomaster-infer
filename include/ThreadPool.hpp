@@ -17,11 +17,10 @@ public:
     ~ThreadPool();
 
     template<class F, class... Args>
-    auto enqueue(F&& f, Args&&... args) 
+    auto enqueue(F&& f, Args&&... args)
         -> std::future<typename std::result_of<F(Args...)>::type>;
 
 private:
-    // 仅声明一次工作线程
     std::vector<std::thread> workers;
     std::queue<std::function<void()>> tasks;
     
@@ -30,7 +29,6 @@ private:
     bool stop;
 };
 
-// 在此文件中包含 ThreadPool 的模板方法实现
-#include "ThreadPool.tpp"
+#include "ThreadPool.tpp" // 包含模板实现
 
 #endif // THREADPOOL_HPP
